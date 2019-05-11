@@ -1,0 +1,8 @@
+datasets/BinaryIrisTrainingData.txt filter=lfs diff=lfs merge=lfs -text
+datasets/IMDBTestData.txt filter=lfs diff=lfs merge=lfs -text
+datasets/IMDBTrainingData.txt filter=lfs diff=lfs merge=lfs -text
+datasets/MNISTTest.txt filter=lfs diff=lfs merge=lfs -text
+datasets/MNISTTraining.txt filter=lfs diff=lfs merge=lfs -text
+datasets/NoisyXORTestData.txt filter=lfs diff=lfs merge=lfs -text
+datasets/NoisyXORTrainingData.txt filter=lfs diff=lfs merge=lfs -text
+datasets/BinaryIrisTestData.txt filter=lfs diff=lfs merge=lfs -text
