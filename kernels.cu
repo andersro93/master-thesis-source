@@ -398,4 +398,3 @@ void initialize_random_states(curandState* states, int seed, unsigned int amount
         curand_init(seed, index, offset, &states[index]);
     }
 }
-

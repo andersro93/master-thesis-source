@@ -6,6 +6,7 @@
 #include <vector>
 #include <thread>
 #include "gpu_kernel.cuh"
+#include "tsetlin_random_wheel.cuh"
 
 using namespace std;
 
@@ -146,13 +147,18 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
 
     // Declare an array for the worker threads
     std::thread* worker_threads = new std::thread[this->classes_amount];
+    
+    // Create a new random generator
+    TsetlinRandomWheel* random_generator = new TsetlinRandomWheel(rand(), this->classes_amount, 65565);
+
+    double* training_times = new double[this->classes_amount];
 
     // Start looping the epochs
     for(int epoch = 1; epoch <= epochs; epoch++)
     {
         // Print feedback
         if(feedback == true){
-            printf("Starting epoch %d \n", epoch);
+            printf("Epoch %d \n", epoch);
         }
 
         // Start all the worker threads
@@ -174,7 +180,9 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
                     this->clauses_amount,
                     this->features_amount,
                     this->automatas_amount,
-                    this->states_amount
+                    this->states_amount,
+                    training_times,
+                    random_generator
                     );
         }
 
@@ -183,6 +191,17 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
             
             // Create a thread for each of the classes that will train and pass the parameters
             worker_threads[class_id].join();
+        }
+
+        // Check if we are to print the time for each class
+        if(feedback) {
+
+            printf("\nTraining time for classes: \n");
+
+            for(unsigned int class_id = 0; class_id < classes_amount; class_id++) {
+                printf("\t- Class %d: %f seconds\n", class_id, training_times[class_id]);
+            }
+            printf("\n");
         }
 
         // Check if we are to validate our model against the loaded validation data
@@ -200,6 +219,7 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
 
     // Some cleanup after the training is done
     delete [] worker_threads;
+    delete [] training_times;
 }
 
 double GPUKernel::validate(bool feedback) {
@@ -341,7 +361,7 @@ double GPUKernel::validate(bool feedback) {
     return accuracy;
 }
 
-void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount) {
+void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount, double* training_times, TsetlinRandomWheel* random_generator) {
 
     // Attempt to select the given GPU
     if(cudaSetDevice(gpu_id) != cudaSuccess) {
@@ -374,15 +394,38 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
     curandState* random_states;
     cudaMalloc(&random_states, sizeof(curandState) * clauses_amount * automatas_amount);
 
-    // Perform some quick calculations
-    dim3 blocks = GPUKernel::calculate_blocks_per_kernel(clauses_amount);
-    dim3 threads = GPUKernel::calculate_threads_per_block(automatas_amount);
-
     // Declare some training specific variables
     bool correct_class;
 
+    // Calculate the launch parameters for each kernel
+    dim3 blocks = GPUKernel::calculate_blocks_per_kernel(clauses_amount);
+    dim3 threads = GPUKernel::calculate_threads_per_block(automatas_amount);
+
+    unsigned int reduce_votes_blocks = 1; // Due to the nature of the kernel, anyway its not like there are millions of clauses
+    unsigned int reduce_votes_threads = (static_cast<unsigned int>(clauses_amount / 32) + 1) * 32;
+
+    unsigned int calculate_feedback_blocks = 1; // This value will stay at one, unless we need more blocks
+    unsigned int calculate_feedback_threads = (static_cast<unsigned int>(clauses_amount / 32) + 1) * 32;
+
+    if(calculate_feedback_threads > 1024) {
+        
+        // Update the amount of blocks that are required
+        calculate_feedback_blocks = (static_cast<unsigned int>(clauses_amount / calculate_feedback_threads)) + 1;
+
+        // Set the amount of threads to be maximum
+        calculate_feedback_threads = 1024;
+    }
+
+    // Check if we are above max threads per block
+    if(reduce_votes_threads > 1024) {
+        reduce_votes_threads = 1024;
+    }
+
     // Initialize the random values
     initialize_random_states<<<blocks, threads, 0, class_stream>>>(random_states, rand(), clauses_amount * automatas_amount);
+
+    // Start the time that is used to measure the training time
+    clock_t start_time = clock();
 
     // Start looping over the batches
     for(unsigned int batch_id = 0; batch_id < batches; batch_id++) {
@@ -394,7 +437,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
             correct_class = (class_id == y_data[sample_id]);
 
             // Check if we are to train the sample on the current class or not
-            if(correct_class || ((1.0 * rand())/ 1.0 * RAND_MAX) > (1.0 / classes_amount)) {
+            if(correct_class || (random_generator->get_random_float(class_id)) > (1.0 / classes_amount)) {
                        
                 // Evaluate the clause output
                 validate_clauses<<<blocks, threads, 0, class_stream>>>(
@@ -411,7 +454,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
                 );
 
                 // Count the votes from the evaluation phase
-                reduce_votes<<<1, 128, sizeof(int) * 128, class_stream>>>(
+                reduce_votes<<<reduce_votes_blocks, reduce_votes_threads, sizeof(int) * reduce_votes_threads, class_stream>>>(
                         score,
                         0,
                         clauses_output, 
@@ -421,7 +464,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
                 );
 
                 // Calculate the feedback to each clause
-                calculate_feedback<<<5, 32, 0, class_stream>>>(
+                calculate_feedback<<<calculate_feedback_blocks, calculate_feedback_threads, 0, class_stream>>>(
                         clauses_feedback,
                         score, 
                         threshold, 
@@ -463,6 +506,9 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
         default:
             printf("train_class_one_epoch(): An unknown CUDA error occured on cudaStreamSynchronize with Class %d, on GPU %d \n", class_id, gpu_id);
     }
+
+    // Stop the time
+    training_times[class_id] = (double)((clock() - start_time) / CLOCKS_PER_SEC);
 
     // Free up space that was used during training
     cudaFree(clauses_output);

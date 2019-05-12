@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include "tsetlin_random_wheel.cuh"
 #include "cpu_kernel.cuh"
 #include "gpu_kernel.cuh"
 

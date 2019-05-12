@@ -1,10 +1,5 @@
-
 #include <stdio.h>
-#include <cuda.h>
-#include <curand.h>
-#include <curand_kernel.h>
 #include <iostream>
-#include <vector>
 #include <thread>
 #include "cpu_kernel.cuh"
 
@@ -90,12 +85,18 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
     // Declare an array for the worker threads
     std::thread* worker_threads = new std::thread[this->classes_amount];
 
+    // Create a new random generator
+    TsetlinRandomWheel* random_generator = new TsetlinRandomWheel(rand(), this->classes_amount, 65565);
+
+    // Create time objects
+    double* training_times = new double[this->classes_amount];
+
     // Start looping the epochs
     for(int epoch = 1; epoch <= epochs; epoch++)
     {
         // Print feedback
         if(feedback == true){
-            printf("Starting epoch %d \n", epoch);
+            printf("Epoch %d \n", epoch);
         }
 
         // Start all the worker threads
@@ -116,7 +117,9 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
                     this->clauses_amount,
                     this->features_amount,
                     this->automatas_amount,
-                    this->states_amount
+                    this->states_amount,
+                    training_times,
+                    random_generator
                     );
         }
 
@@ -125,6 +128,17 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
             
             // Create a thread for each of the classes that will train and pass the parameters
             worker_threads[class_id].join();
+        }
+
+        // Check if we are to print the time for each class
+        if(feedback) {
+
+            printf("\nTraining time for classes: \n");
+
+            for(unsigned int class_id = 0; class_id < classes_amount; class_id++) {
+                printf("\t- Class %d: %f seconds\n", class_id, training_times[class_id]);
+            }
+            printf("\n");
         }
 
         // Check if we are to validate our model against the loaded validation data
@@ -142,6 +156,7 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
 
     // Some cleanup after the training is done
     delete [] worker_threads;
+    delete random_generator;
 }
 
 double CPUKernel::validate(bool feedback) {
@@ -282,7 +297,7 @@ double CPUKernel::validate(bool feedback) {
     return accuracy;
 }
 
-void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount) {
+void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount, double* training_times, TsetlinRandomWheel* random_generator) {
 
     // Allocate some memory that will be used during training
     // Got some errors using C++ construct syntax, so reverted to C malloc syntax
@@ -292,6 +307,9 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
 
     // Declare some training specific variables
     bool correct_class;
+
+    // Start the time that is used to measure the training time
+    clock_t start_time = clock();
 
     // Start looping over the batches
     for(unsigned int batch_id = 0; batch_id < batches; batch_id++) {
@@ -303,7 +321,7 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
             correct_class = (class_id == y_data[sample_id]);
 
             // Check if we are to train the sample on the current class or not
-            if(correct_class || ((1.0 * rand())/ 1.0 * RAND_MAX) > (1.0 / classes_amount)) {
+            if(correct_class || random_generator->get_random_float(class_id) > (1.0 / classes_amount)) {
                        
                 // Evaluate the clause output
                 validate_clauses(
@@ -337,7 +355,8 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
                         s, 
                         class_id, 
                         correct_class, 
-                        clauses_amount
+                        clauses_amount,
+                        random_generator
                 );
 
                 // Perform feedback on the model
@@ -354,11 +373,15 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
                         automatas_amount, 
                         states_amount, 
                         threshold, 
-                        s
+                        s,
+                        random_generator
                 );
             }
         }
     }
+
+    // Stop the time
+    training_times[class_id] = (double)((clock() - start_time) / CLOCKS_PER_SEC);
 
     // Free up space that was used during training
     free(clauses_output);
@@ -427,6 +450,7 @@ void CPUKernel::print_model() {
     printf("\n");
 }
 
+
 void inline CPUKernel::validate_clauses(unsigned int* model, bool* clauses_output, unsigned int* x_data, unsigned int sample_id, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int class_id, unsigned int max_state, bool prediction) {
 
     // Declare some variables
@@ -491,7 +515,7 @@ void inline CPUKernel::reduce_votes(int* scores, unsigned int scores_index, bool
     scores[scores_index] = temp_score;
 }
 
-void inline CPUKernel::calculate_feedback(unsigned int* clauses_feedback, int* scores, unsigned int threshold, float s, unsigned int class_id, bool correct_class, unsigned int clauses_amount) {
+void inline CPUKernel::calculate_feedback(unsigned int* clauses_feedback, int* scores, unsigned int threshold, float s, unsigned int class_id, bool correct_class, unsigned int clauses_amount, TsetlinRandomWheel* random_generator) {
     
     // Declare some private variables
     int clause_polarity;
@@ -507,7 +531,7 @@ void inline CPUKernel::calculate_feedback(unsigned int* clauses_feedback, int* s
         if (correct_class == true) {
             
             // Check if we are to skip feedback for this clause
-            if(((1.0 * rand() ) / (1.0 * RAND_MAX)) > (((1.0 * threshold) - class_score) / (2.0 * threshold))) {
+            if((random_generator->get_random_float(class_id)) > (((1.0 * threshold) - class_score) / (2.0 * threshold))) {
 
                 // No feedback will be given to this clause
                 clauses_feedback[clause_id] = 0;
@@ -526,7 +550,7 @@ void inline CPUKernel::calculate_feedback(unsigned int* clauses_feedback, int* s
         else {
 
             // Check if we are to skip feedback for this clause
-            if(((1.0 * rand() ) / (1.0 * RAND_MAX)) > (((1.0 * threshold) + class_score) / (2.0 * threshold))) {
+            if((random_generator->get_random_float(class_id)) > (((1.0 * threshold) + class_score) / (2.0 * threshold))) {
 
                 // No feedback will be given to this clause
                 clauses_feedback[clause_id] = 0;
@@ -545,7 +569,7 @@ void inline CPUKernel::calculate_feedback(unsigned int* clauses_feedback, int* s
     }
 }
 
-void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned int* clauses_feedback, unsigned int* x_data, bool* clauses_output, unsigned int class_id, unsigned int sample_id, bool correct_class, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int max_state, unsigned int threshold, float s) {
+void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned int* clauses_feedback, unsigned int* x_data, bool* clauses_output, unsigned int class_id, unsigned int sample_id, bool correct_class, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int max_state, unsigned int threshold, float s, TsetlinRandomWheel* random_generator) {
 
     // Used to calculate the absolute index of an automata
     unsigned int automata_model_index;
@@ -578,7 +602,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                     // Get the value for the automata
                     automata_temp = model[automata_model_index];
 
-                    if((automata_temp > 1) && (((1.0 * rand() ) / (1.0 * RAND_MAX)) <= (1.0 / s))) {
+                    if((automata_temp > 1) && ((random_generator->get_random_float(class_id)) <= (1.0 / s))) {
                         model[automata_model_index] = automata_temp - 1;
                     }
                 }
@@ -607,7 +631,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                         if(automata_polarity == -1){
                         
                             // Increment state
-                            if((((1.0 * rand() ) / (1.0 * RAND_MAX)) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
+                            if(((random_generator->get_random_float(class_id)) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
                                 model[automata_model_index] = automata_temp + 1;
                             }
                         }
@@ -615,7 +639,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                         else {
 
                             // Decrement state
-                            if((((1.0 * rand() ) / (1.0 * RAND_MAX)) <= (1.0 / s)) && automata_temp > 1) {
+                            if(((random_generator->get_random_float(class_id)) <= (1.0 / s)) && automata_temp > 1) {
                                 model[automata_model_index] = automata_temp - 1;
                             }
                         }
@@ -628,7 +652,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                         if(automata_polarity == 1) {
                     
                             // Decrement the state 
-                            if((((1.0 * rand() ) / (1.0 * RAND_MAX)) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
+                            if(((random_generator->get_random_float(class_id)) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
                                 model[automata_model_index] = automata_temp + 1;
                             }
                         }
@@ -636,7 +660,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                         else {
                         
                             // Decrement state
-                            if((((1.0 * rand() ) / (1.0 * RAND_MAX)) <= (1.0 / s)) && automata_temp > 1) {
+                            if(((random_generator->get_random_float(class_id)) <= (1.0 / s)) && automata_temp > 1) {
                                 model[automata_model_index] = automata_temp - 1;
                             }
                         }

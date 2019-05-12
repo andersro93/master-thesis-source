@@ -4,8 +4,9 @@
 
 // Some constants that will be used throughout the experiment
 #define RANDOM_SEED 1337
+#define RANDOM_WHEEL 10000
 #define EPOCHS 100
-#define BATCHES 200
+#define BATCHES 1
 #define VALIDATION true
 #define DEBUG_MODE true
 #define PRINT_MODEL false
