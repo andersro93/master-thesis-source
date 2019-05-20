@@ -56,7 +56,7 @@ public:
   unsigned int states_amount {0};
 
   // Private training methods
-  static void train_class_one_epoch(unsigned int class_id, unsigned int gpu_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount, double* training_times, TsetlinRandomWheel* random_generator);
+  static void train_class_one_epoch(unsigned int class_id, unsigned int gpu_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount, float* training_times, TsetlinRandomWheel* random_generator);
   static void validate_class(unsigned int class_id, unsigned int gpu_id, unsigned int* model, unsigned int* x_val, unsigned int* y_val, int* scores, unsigned int samples_amount, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int max_state);
 
   // GPU related methods

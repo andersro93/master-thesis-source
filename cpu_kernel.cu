@@ -1,13 +1,25 @@
 #include <stdio.h>
 #include <iostream>
 #include <thread>
+#include <time.h>
+#include <chrono>
+#include <cmath>
 #include "cpu_kernel.cuh"
 
 using namespace std;
 
 CPUKernel::CPUKernel(){
-
+    
 };
+
+void CPUKernel::enable_ssl_s(double delta_s) {
+
+    // Store the delta for s
+    this->delta_s = delta_s;
+
+    // Enable the SSL for s flag
+    this->ssl_s_enabled = true;
+}
 
 void CPUKernel::load_model(const unsigned int* model, unsigned int classes, unsigned int clauses, unsigned int automatas, unsigned int states) {
 
@@ -20,12 +32,12 @@ void CPUKernel::load_model(const unsigned int* model, unsigned int classes, unsi
 
     // Check if an model has already been loaded, if so, deallocate its memory
     if(this->model != nullptr) {
-        delete [] this->model;
+        free(this->model);
         this->model = nullptr;
     }
 
     // Allocate memory for the model
-    this->model = new unsigned int[classes * clauses * automatas];
+    this->model = (unsigned int*) malloc(sizeof(unsigned int) * classes * clauses * automatas);
 
     // Copy the data to the kernel memory
     memcpy(this->model, model, sizeof(unsigned int) * classes * clauses * automatas); 
@@ -35,17 +47,17 @@ void CPUKernel::load_training_data(const unsigned int* x_train, const unsigned i
 
     // First cleanup if previous training data has been loaded
     if(this->x_train != nullptr) {
-        delete [] this->x_train;
+        free(this->x_train);
         this->x_train = nullptr;
     }
     if(this->y_train != nullptr) {
-        delete [] this->y_train;
+        free(this->y_train);
         this->y_train = nullptr;
     }
 
     // Allocate memory for training data
-    this->x_train = new unsigned int[this->features_amount * train_samples_n];
-    this->y_train = new unsigned int[train_samples_n];
+    this->x_train = (unsigned int*) malloc(sizeof(unsigned int*) * this->features_amount * train_samples_n);
+    this->y_train = (unsigned int*) malloc(sizeof(unsigned int*) * train_samples_n);
 
     // Copy the data from provided model to kernel
     memcpy(this->x_train, x_train, sizeof(unsigned int) * this->features_amount * train_samples_n);
@@ -59,17 +71,17 @@ void CPUKernel::load_validation_data(const unsigned int* x_val, const unsigned i
 
     // First cleanup if previous training data has been loaded
     if(this->x_val != nullptr) {
-        delete [] this->x_val;
+        free(this->x_val);
         this->x_val = nullptr;
     }
     if(this->y_val != nullptr) {
-        delete [] this->y_val;
+        free(this->y_val);
         this->y_val = nullptr;
     }
 
     // Allocate memory for validation data
-    this->x_val = new unsigned int[this->features_amount * val_samples_n];
-    this->y_val = new unsigned int[val_samples_n];
+    this->x_val = (unsigned int*) malloc(sizeof(unsigned int) * this->features_amount * val_samples_n);
+    this->y_val = (unsigned int*) malloc(sizeof(unsigned int) * val_samples_n);
 
     // Copy the data from provided model to kernel
     memcpy(this->x_val, x_val, sizeof(unsigned int) * this->features_amount * val_samples_n);
@@ -83,21 +95,87 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
 {
 
     // Declare an array for the worker threads
-    std::thread* worker_threads = new std::thread[this->classes_amount];
+    //std::thread* worker_threads = new std::thread[this->classes_amount];
+    std::thread* worker_threads = (std::thread*) malloc(sizeof(std::thread) * this->classes_amount);
 
     // Create a new random generator
     TsetlinRandomWheel* random_generator = new TsetlinRandomWheel(rand(), this->classes_amount, 65565);
 
     // Create time objects
-    double* training_times = new double[this->classes_amount];
+    double* training_times = (double*) malloc(sizeof(double) * this->classes_amount);
+
+    // Create an array that will hold the accuracy for each epochs
+    double* accuracy_epochs = (double*) malloc(sizeof(double) * epochs);
+    float s_tempromary = s;
+    
+    // Declare filestream for writing the results
+    std::ofstream result_stream;
+
+    // If feedback, open a result file 
+    if(feedback == true) {
+
+        // Open the filestream
+        result_stream.open("training_result.csv");
+
+        // Write the header of the file
+        result_stream << "epoch;accuracy;s;s_temp;time\n";
+    }
 
     // Start looping the epochs
-    for(int epoch = 1; epoch <= epochs; epoch++)
+    for(int epoch = 0; epoch < epochs; epoch++)
     {
         // Print feedback
         if(feedback == true){
-            printf("Epoch %d \n", epoch);
+            printf("Epoch %d \n", epoch+1);
         }
+
+        // Check if we are using ssl on the S value
+        if(validation == true && this->ssl_s_enabled == true) {
+            
+            // Check if we are on a epoch that is divisble by 3 (then we are to perform a calculation for the new S value)
+            if((epoch % 3) == 0 && epoch != 0) {
+                
+                // Check if one of the variants on the S value is better than the current one
+                if(std::max(accuracy_epochs[epoch-2], accuracy_epochs[epoch-1]) > accuracy_epochs[epoch-3]){
+
+                    // The accuracy has been better when adjusting down or up
+                    // Lets figure out which way to adjust, lets check if the optimal was to adjust up
+                    if(accuracy_epochs[epoch-2] > accuracy_epochs[epoch-1]) {
+                        s -= this->delta_s;
+                        printf("Adjusting the S value to %f \n", s);
+                    }
+                    // Assuming that moving the S in positive direction is better. Or that they are equal, in that case, increase.
+                    else{
+                        s += this->delta_s;
+                        printf("Adjusting the S value to %f \n", s);
+                    }
+
+                    // Set the tempromary s value to the new s value
+                    s_tempromary = s;
+                }
+            }
+            // Check if we are on the epoch to decrement the S value
+            else if((epoch % 3) == 1) {
+                s_tempromary = s - this->delta_s;
+
+                if(feedback == true) {
+                    printf("Current S value %f \n", s);
+                    printf("Attempting S value %f \n", s_tempromary);
+                }
+            }
+            // Check if we are on the epoch to increment the S value
+            else if((epoch % 3) == 2){
+                s_tempromary = s + this->delta_s;
+
+                if(feedback == true) {
+                    printf("Current S value %f \n", s);
+                    printf("Attempting S value %f \n", s_tempromary);
+                }
+            }
+        }
+
+        // Start the epoch timer
+        auto start = chrono::high_resolution_clock::now(); 
 
         // Start all the worker threads
         for(unsigned int class_id = 0; class_id < this->classes_amount; class_id++) {
@@ -108,7 +186,7 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
                     class_id,
                     batches,
                     threshold,
-                    s,
+                    s_tempromary,
                     this->model,
                     this->x_train,
                     this->y_train,
@@ -130,6 +208,12 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
             worker_threads[class_id].join();
         }
 
+        // Stop the timer
+        auto stop = chrono::high_resolution_clock::now(); 
+
+        // Calculate the time used in seconds
+        double time_used = chrono::duration_cast<chrono::nanoseconds>(stop - start).count() / 1000000000.0;
+
         // Check if we are to print the time for each class
         if(feedback) {
 
@@ -144,8 +228,11 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
         // Check if we are to validate our model against the loaded validation data
         if(validation == true)
         {
-            // If validation is turned on
-            validate(feedback);
+            // Perform validation and store the accuracy in the list of accuracies
+            accuracy_epochs[epoch] = validate(feedback);
+
+            // Print to file
+            result_stream << epoch << ";" << accuracy_epochs[epoch] << ";" << s << ";" <<s_tempromary << ";" << time_used << "\n";
         }
 
         if(print_model_after_epoch == true) {
@@ -154,8 +241,19 @@ void CPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
         }
     }
 
+    if(feedback == true) {
+        result_stream.close();
+    }
+
     // Some cleanup after the training is done
-    delete [] worker_threads;
+    // delete [] worker_threads;
+    printf("Worker threads free \n");
+    free(worker_threads);
+    printf("Training times free \n");
+    free(training_times);
+    printf("Accuracy epochs free \n");
+    free(accuracy_epochs);
+    printf("Random generator free \n");
     delete random_generator;
 }
 
@@ -249,7 +347,7 @@ double CPUKernel::validate(bool feedback) {
     }
 
     // Calculate the accuracy
-    accuracy = (1.0 * correct_guesses) / (correct_guesses + wrong_guesses);
+    accuracy = (1.0f * correct_guesses) / (correct_guesses + wrong_guesses);
 
     // Check if we should print the results to console
     if(feedback == true) {
@@ -266,13 +364,13 @@ double CPUKernel::validate(bool feedback) {
             printf("\n================ \n");
             printf("Class: %d \n", class_id);
             if(total_predicted_for_class[class_id] != 0) {
-                printf("Precission: %f \n", (1.0 * correct_guesses_for_class[class_id]) / (total_predicted_for_class[class_id]));
+                printf("Precission: %f \n", (1.0f * correct_guesses_for_class[class_id]) / (total_predicted_for_class[class_id]));
             }
             else {
                 printf("Precission: N/A \n");
             }
             if(total_samples_for_class[class_id] != 0) {
-                printf("Recall: %f \n", (1.0 * correct_guesses_for_class[class_id]) / (total_samples_for_class[class_id]));
+                printf("Recall: %f \n", (1.0f * correct_guesses_for_class[class_id]) / (total_samples_for_class[class_id]));
             }
             else {
                 printf("Recall: N/A \n");
@@ -309,7 +407,7 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
     bool correct_class;
 
     // Start the time that is used to measure the training time
-    clock_t start_time = clock();
+    auto start_time = chrono::high_resolution_clock::now(); 
 
     // Start looping over the batches
     for(unsigned int batch_id = 0; batch_id < batches; batch_id++) {
@@ -321,7 +419,7 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
             correct_class = (class_id == y_data[sample_id]);
 
             // Check if we are to train the sample on the current class or not
-            if(correct_class || random_generator->get_random_float(class_id) > (1.0 / classes_amount)) {
+            if(correct_class || random_generator->get_random_float(class_id) < (1.0f / (1.0f * classes_amount))) {
                        
                 // Evaluate the clause output
                 validate_clauses(
@@ -342,7 +440,6 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
                         score,
                         0,
                         clauses_output, 
-                        class_id, 
                         clauses_amount, 
                         threshold
                 );
@@ -381,7 +478,9 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
     }
 
     // Stop the time
-    training_times[class_id] = (double)((clock() - start_time) / CLOCKS_PER_SEC);
+    auto stop_time = chrono::high_resolution_clock::now(); 
+    double time_used = chrono::duration_cast<chrono::nanoseconds>(stop_time - start_time).count();
+    training_times[class_id] = time_used / 1000000000.0; // Convert from nanoseconds, to seconds
 
     // Free up space that was used during training
     free(clauses_output);
@@ -417,9 +516,8 @@ void CPUKernel::validate_class(unsigned int class_id, unsigned int* model, unsig
                 scores,
                 ((sample_id * classes_amount) + class_id),
                 clauses_output, 
-                class_id, 
                 clauses_amount, 
-                0 
+                0
         );
 
     }
@@ -501,7 +599,7 @@ void inline CPUKernel::validate_clauses(unsigned int* model, bool* clauses_outpu
     }
 }
 
-void inline CPUKernel::reduce_votes(int* scores, unsigned int scores_index, bool* clauses_output, unsigned int class_id, unsigned int clauses_amount, unsigned int threshold) {
+void inline CPUKernel::reduce_votes(int* scores, unsigned int scores_index, bool* clauses_output, unsigned int clauses_amount, unsigned int threshold) {
 
     // Store the score tempromary in a variable
     int temp_score = 0;
@@ -509,6 +607,18 @@ void inline CPUKernel::reduce_votes(int* scores, unsigned int scores_index, bool
     for(unsigned int clause_id = 0; clause_id < clauses_amount; clause_id++) {
 
         temp_score += (get_polarity(clause_id) * clauses_output[clause_id]);
+    }
+
+    if(threshold != 0) {
+
+        if(temp_score > threshold) 
+        {
+            temp_score = threshold;
+        }
+        else if(temp_score < -threshold)
+        {
+            temp_score = -threshold;
+        }
     }
 
     // Save the score to a given location
@@ -531,40 +641,32 @@ void inline CPUKernel::calculate_feedback(unsigned int* clauses_feedback, int* s
         if (correct_class == true) {
             
             // Check if we are to skip feedback for this clause
-            if((random_generator->get_random_float(class_id)) > (((1.0 * threshold) - class_score) / (2.0 * threshold))) {
+            if((random_generator->get_random_float(class_id)) > ((1.0f * (threshold - class_score) / (2.0f * threshold)))) {
 
                 // No feedback will be given to this clause
                 clauses_feedback[clause_id] = 0;
                 continue;
             }
-
-            if(clause_polarity == 1) {
-                
-                clauses_feedback[clause_id] = 1;
-            }
-            else {
             
-                clauses_feedback[clause_id] = 2;
-            }
+            // A small performant operation that calculates that will return the following
+            // Clauses for = Type 1 feedback
+            // Clauses against = Type 2 feedback
+            clauses_feedback[clause_id] = 1 + (std::signbit(clause_polarity));
         }
         else {
 
             // Check if we are to skip feedback for this clause
-            if((random_generator->get_random_float(class_id)) > (((1.0 * threshold) + class_score) / (2.0 * threshold))) {
+            if((random_generator->get_random_float(class_id)) > ((1.0f * (threshold + class_score) / (2.0f * threshold)))) {
 
                 // No feedback will be given to this clause
                 clauses_feedback[clause_id] = 0;
                 continue;
             }
 
-            if(clause_polarity == 1) {
-                
-                clauses_feedback[clause_id] = 2;
-            }
-            else {
-            
-                clauses_feedback[clause_id] = 1;
-            }
+            // A small performant operation that calculates that will return the following
+            // Clauses for = Type 2 feedback
+            // Clauses against = Type 1 feedback
+            clauses_feedback[clause_id] = 2 - (signbit(clause_polarity));
         }
     }
 }
@@ -631,7 +733,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                         if(automata_polarity == -1){
                         
                             // Increment state
-                            if(((random_generator->get_random_float(class_id)) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
+                            if(((random_generator->get_random_float(class_id)) <= ((s - 1.0f) / s)) && (automata_temp < max_state)) {
                                 model[automata_model_index] = automata_temp + 1;
                             }
                         }
@@ -639,7 +741,7 @@ void inline CPUKernel::give_feedback_to_clauses(unsigned int* model, unsigned in
                         else {
 
                             // Decrement state
-                            if(((random_generator->get_random_float(class_id)) <= (1.0 / s)) && automata_temp > 1) {
+                            if(((random_generator->get_random_float(class_id)) <= (1.0f / s)) && automata_temp > 1) {
                                 model[automata_model_index] = automata_temp - 1;
                             }
                         }
@@ -735,6 +837,7 @@ int inline CPUKernel::get_polarity(int id){
 
 CPUKernel::~CPUKernel() {
 
+    printf("CPUKernel destructor \n");
 
     // Free up memory from the devices
     if(this->model != nullptr) {

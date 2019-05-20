@@ -17,29 +17,31 @@ struct dataset {
     unsigned int samples_validation {0};
 
     // Just have some initial values for the dataset
+    unsigned int batches {0};
     unsigned int threshold {0};
     double s {0.0};
 
-    dataset(unsigned int features, unsigned int samples_training, unsigned int samples_validation, double s, unsigned int threshold){
+    dataset(unsigned int features, unsigned int samples_training, unsigned int samples_validation, unsigned int batches, double s, unsigned int threshold){
         this->features = features;
         this->samples_training = samples_training;
         this->samples_validation = samples_validation;
+        this->batches = batches;
         this->s = s;
         this->threshold = threshold;
     }
 
     ~dataset(){
-        if(x_data_train){
-            delete [] x_data_train;
+        if(x_data_train != nullptr){
+            free(x_data_train);
         }
-        if(y_data_train){
-            delete [] y_data_train;
+        if(y_data_train != nullptr){
+            free(y_data_train);
         }
-        if(x_data_validation){
-            delete [] x_data_validation;
+        if(x_data_validation != nullptr){
+            free(x_data_validation);
         }
-        if(y_data_validation){
-            delete [] y_data_validation;
+        if(y_data_validation != nullptr){
+            free(y_data_validation);
         }
     }
 };
@@ -61,8 +63,8 @@ struct model {
     }
 
     ~model(){
-        if(data){
-            delete [] data;
+        if(data != nullptr){
+            free(data);
         }
     }
 };
@@ -87,3 +89,4 @@ void load_from_file(dataset* data, std::string training_file, std::string valida
 bool validate_arguments(int argc, const char* argv[]);
 void print_instructions();
 void print_splash();
+

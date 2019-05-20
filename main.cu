@@ -5,8 +5,8 @@
 // Some constants that will be used throughout the experiment
 #define RANDOM_SEED 1337
 #define RANDOM_WHEEL 10000
-#define EPOCHS 100
-#define BATCHES 1
+#define EPOCHS 1000
+#define DELTA_S 1.0
 #define VALIDATION true
 #define DEBUG_MODE true
 #define PRINT_MODEL false
@@ -61,6 +61,8 @@ int main(int argc, const char* argv[])
     }
 
     // Print information about the dataset
+    printf("\tEpochs %d \n", EPOCHS);
+    printf("\tBatches %d \n", data.batches);
     printf("\tSamples Training: %d \n", data.samples_training);
     printf("\tSamples Validation: %d \n", data.samples_validation);
 
@@ -89,8 +91,15 @@ int main(int argc, const char* argv[])
         kernel.load_training_data(data.x_data_train, data.y_data_train, data.samples_training);
         kernel.load_validation_data(data.x_data_validation, data.y_data_validation, data.samples_validation);
 
+        // Check if we are using experimental S
+        if(std::stoi(argv[3]) == 2) {
+            
+            printf("Experimental S enabled with an delta of %f \n", DELTA_S);
+            kernel.enable_ssl_s(DELTA_S);
+        }
+
         // Start the fitting of the model
-        kernel.fit(EPOCHS, BATCHES, VALIDATION, data.threshold, data.s, DEBUG_MODE, PRINT_MODEL);
+        kernel.fit(EPOCHS, data.batches, VALIDATION, data.threshold, data.s, DEBUG_MODE, PRINT_MODEL);
     }
     else if(std::stoi(argv[1]) == COMPUTE_GPU) {
 
@@ -116,11 +125,12 @@ int main(int argc, const char* argv[])
         kernel.load_validation_data(data.x_data_validation, data.y_data_validation, data.samples_validation);
 
         // Start the fitting of the model
-        kernel.fit(EPOCHS, BATCHES, VALIDATION, data.threshold, data.s, DEBUG_MODE, PRINT_MODEL);
+        kernel.fit(EPOCHS, data.batches, VALIDATION, data.threshold, data.s, DEBUG_MODE, PRINT_MODEL);
 
-        // Cleanup the allocated storage
-        cudaDeviceReset();
     }
+
+    // Reset cuda device
+    cudaDeviceReset();
 
     return 0;
 }
@@ -155,9 +165,11 @@ model get_model(int dataset_id) {
         return create_model(2, 2000, 5000, 10000, 500);
     }
     else if(dataset_id == DATASET_IRIS) {
+        // 3 classes, 300 Clauses, 16 features, 32 automata, 100 states
         return create_model(3, 300, 16, 32, 100);
     }
     else if(dataset_id == DATASET_MNIST) {
+        // 10 classes, 2000 clauses, 784 features, 1568 automata, 100 states
         return create_model(10, 2000, 784, 1568, 100);
     }
 
@@ -172,6 +184,7 @@ dataset load_imdb_dataset()
         5000,           // Amount of features on the samples
         25000,          // Amount of training samples
         25000,          // Amount of validation samples
+        1,              // Amount of batches per epoch
         27.0,           // Initial S value
         40              // Threshold value
     };
@@ -189,6 +202,7 @@ dataset load_mnist_dataset() {
         784,            // Amount of features on the samples
         60000,          // Amount of training samples
         10000,          // Amount of validation samples
+        1,              // Amount of batches per epoch
         10.0,           // Initial S value
         50              // Threshold value
     };
@@ -206,6 +220,7 @@ dataset load_iris_dataset()
         16,             // Amount of features on the samples
         120,            // Amount of training samples
         30,             // Amount of validation samples
+        100,            // Amount of batches per epoch
         3.0,            // Initial S value
         10              // Threshold value
     };
@@ -223,6 +238,7 @@ dataset load_noisyxor_dataset()
         12,             // Amount of features on the samples
         5000,           // Amount of training samples
         5000,           // Amount of validation samples
+        200,            // Amount of batches per epoch
         3.9,            // Initial S value
         25              // Threshold value
     };
@@ -252,8 +268,8 @@ void load_from_file(dataset* data, std::string training_file, std::string valida
 	}
 
     // Initialize the arrays that will contain the training data
-    data->x_data_train = new unsigned int[data->samples_training * data->features];
-    data->y_data_train = new unsigned int[data->samples_training];
+    data->x_data_train = (unsigned int*) malloc(sizeof(unsigned int*) * data->samples_training * data->features);
+    data->y_data_train = (unsigned int*) malloc(sizeof(unsigned int) * data->samples_training);
 
     // Read inn all the training data
 	for (int sample_index = 0; sample_index < data->samples_training; sample_index++) {
@@ -281,8 +297,8 @@ void load_from_file(dataset* data, std::string training_file, std::string valida
 	}
 
     // Initialize the arrays that will contain the training data
-    data->x_data_validation = new unsigned int[data->features * data->samples_validation];
-    data->y_data_validation = new unsigned int[data->samples_validation];
+    data->x_data_validation = (unsigned int*) malloc(sizeof(unsigned int*) * data->features * data->samples_validation);
+    data->y_data_validation = (unsigned int*) malloc(sizeof(unsigned int*) * data->samples_validation);
 
     // Read inn all the training data
 	for (int sample_index = 0; sample_index < data->samples_validation; sample_index++) {
@@ -309,7 +325,7 @@ model create_model(unsigned int classes, unsigned int clauses, unsigned int feat
     };
 
     // Allocate storage for the model
-    model.data = new unsigned int[classes * clauses * automatas];
+    model.data = (unsigned int*) malloc(sizeof(unsigned int) * classes * clauses * automatas);
 
     // Randomize the states of the model
     for(unsigned int index = 0; index < (classes * clauses * automatas); index += 1)

@@ -9,17 +9,36 @@
 __device__ __forceinline__ 
 int get_polarity(int id) {
 
-    // If id is an even number, 1 will be returned.
-    // If id is an odd number, -1 will be returned.
-    return 1 - (2 * (id & 1));
+    // Check the id for a "for" polarity
+    if ((id & 1) == 0) {
+
+        // Id is a for polarity
+        return 1;
+    }
+
+    // Previous check failed, therefore the id's polarity must be "against"
+    return -1;
 }
 
 __device__ __forceinline__
 bool automata_action(unsigned int automata_state, unsigned int max_state) {
 
-    // Returns true if the automata is in an include state, while false if the automata is in an exclude state
     return (automata_state > (static_cast<unsigned int>(max_state / 2))); 
 }
+
+__device__ __forceinline__
+int apply_threshold(int score, unsigned int threshold) {
+
+    if(score > threshold) {
+        score = static_cast<int>(threshold);
+    }
+    else if(score < -threshold) {
+        score = -static_cast<int>(threshold);
+    }
+
+    return score;
+}
+
 
 __global__
 void validate_clauses(unsigned int* model, bool* clauses_output, unsigned int* x_data, unsigned int sample_id, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int class_id, unsigned int max_state, bool prediction) 
@@ -93,18 +112,18 @@ void validate_clauses(unsigned int* model, bool* clauses_output, unsigned int* x
         {
             // Check if the clause was, when finished evaluating, evaluated to false
             if(shared[0] == false || (prediction == true && shared[1] == true)) {
-                clauses_output[clause_id] = false;
+                clauses_output[clause_id] = 0;
             }
             // Assuming it was not false, then it is true
             else {
-                clauses_output[clause_id] = true;
+                clauses_output[clause_id] = 1;
             }
         }
     }
 }
 
 __global__
-void reduce_votes(int* scores, unsigned int scores_index, bool* clauses_output, unsigned int clauses_amount, unsigned int threshold) {
+void reduce_votes(int* scores, unsigned int scores_index, bool* clauses_output, unsigned int class_id, unsigned int clauses_amount, unsigned int threshold) {
 
     // Tempromary shared results
     extern __shared__ int results[];
@@ -138,16 +157,6 @@ void reduce_votes(int* scores, unsigned int scores_index, bool* clauses_output, 
     // Thread 0 will store the result in the scores list
     if(threadIdx.x == 0)
     {
-        if(threshold != 0) {
-
-            if(results[threadIdx.x] > threshold) {
-                results[threadIdx.x] = static_cast<int>(threshold);
-            }
-            else if(results[threadIdx.x] < -threshold) {
-                results[threadIdx.x] = -static_cast<int>(threshold);
-            }
-        }
-
         scores[scores_index] = results[threadIdx.x];
     }
 }
@@ -160,51 +169,245 @@ void calculate_feedback(unsigned int* clauses_feedback, int* scores, unsigned in
 
     // Declare some private variables
     curandState rnd_state = random_states[global_thread_id];
-    float clause_polarity;
+    int clause_polarity;
     int class_score = scores[0];
 
     // Loop all clauses 
     for (unsigned int clause_id = global_thread_id; clause_id < clauses_amount; clause_id += gridDim.x) {
    
         // Determine the polarity of the clause
-        clause_polarity = static_cast<float>(get_polarity(clause_id));
+        clause_polarity = get_polarity(clause_id);
 
         // Check if we are on the correct class
         if (correct_class == true) {
             
             // Check if we are to skip feedback for this clause
-            if(curand_uniform(&rnd_state) > (((1.0f * threshold) - class_score) / (2.0f * threshold))) {
+            if(curand_uniform(&rnd_state) > (((1.0 * threshold) - class_score) / (2.0 * threshold))) {
 
                 // No feedback will be given to this clause
                 clauses_feedback[clause_id] = 0;
-            }
-            else {
-                // A small performant operation that calculates that will return the following
-                // Clauses for = Type 1 feedback
-                // Clauses against = Type 2 feedback
-                clauses_feedback[clause_id] = 1 + static_cast<int>(signbit(clause_polarity));
+                continue;
             }
 
+            if(clause_polarity == 1) {
+                
+                clauses_feedback[clause_id] = 1;
+            }
+            else {
+            
+                clauses_feedback[clause_id] = 2;
+            }
         }
         else {
 
             // Check if we are to skip feedback for this clause
-            if(curand_uniform(&rnd_state) > (((1.0f * threshold) + class_score) / (2.0f * threshold))) {
+            if(curand_uniform(&rnd_state) > (((1.0 * threshold) + class_score) / (2.0 * threshold))) {
 
                 // No feedback will be given to this clause
                 clauses_feedback[clause_id] = 0;
+                continue;
+            }
+
+            if(clause_polarity == 1) {
+                
+                clauses_feedback[clause_id] = 2;
             }
             else {
-                // A small performant operation that calculates that will return the following
-                // Clauses for = Type 2 feedback
-                // Clauses against = Type 1 feedback
-                clauses_feedback[clause_id] = 2 - static_cast<int>(signbit(clause_polarity));
-            }
             
+                clauses_feedback[clause_id] = 1;
+            }
         }
     }
 
     // Copy the random state back to global memory
+    random_states[global_thread_id] = rnd_state;
+}
+
+__global__ 
+void type_1_feedback(unsigned int* model, unsigned int* clauses_feedback, unsigned int* x_data, bool* clauses_output, unsigned int class_id, unsigned int sample_id, const bool correct_class, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int max_state, unsigned int threshold, float s, curandState* random_states) {
+    
+    // Calculate and declare some "private variables"
+    // Get the clause id, based on the block id in the grid
+    unsigned int global_thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
+   
+    // Used to calculate the absolute index of an automata
+    unsigned int automata_model_index;
+    unsigned int automata_temp;
+
+    // Used to tempromary store the polarity of an automata
+    int automata_polarity;
+
+    // Used to tempromary store the feature id of which feature an automata is associated with
+    unsigned int sample_value;
+
+    // Get the random state from the random values matrix (used to generate "random" numbers)
+    curandState rnd_state = random_states[global_thread_id];
+
+    // In case there are more clauses than blocks, we need to loop them 
+    for(unsigned int clause_id = blockIdx.x; clause_id < clauses_amount; clause_id += gridDim.x) {
+        
+        // Check if we are to do type 1 feedback
+        if(clauses_feedback[clause_id] == 1){
+        
+            // If the clause output was evaluated to false
+            if(clauses_output[clause_id] == 0) {
+            
+                // Loop and potentially punish all automatas
+                for(unsigned int automata_index = threadIdx.x; automata_index < automatas_amount; automata_index += blockDim.x) {
+                
+                    // Calculate the position of the current automata
+                    automata_model_index = (class_id * clauses_amount * automatas_amount) + (clause_id * automatas_amount) + automata_index;
+
+                    // Get the value for the automata
+                    automata_temp = model[automata_model_index];
+
+                    if((automata_temp > 1) && (curand_uniform(&rnd_state) <= (1.0 / s))) {
+                        model[automata_model_index] = automata_temp - 1;
+                    }
+                }
+            }
+            else {
+            
+                // Loop over each of the automatas
+                for(unsigned int automata_index = threadIdx.x; automata_index < automatas_amount; automata_index += blockDim.x){
+                
+                    // Calculate the position of the current automata
+                    automata_model_index = (class_id * clauses_amount * automatas_amount) + (clause_id * automatas_amount) + automata_index;
+            
+                    // Get the value of the sample for the current automata
+                    sample_value = x_data[(sample_id * features_amount) + static_cast<unsigned int>(automata_index / 2)];
+
+                    // Calculate the polarity of the automata
+                    automata_polarity = get_polarity(automata_index);
+
+                    // Get the value for the automata
+                    automata_temp = model[automata_model_index];
+
+                    // Check if the sample was False
+                    if(sample_value == 0) {
+                
+                        // Check if the automata is an against automata
+                        if(automata_polarity == -1){
+                        
+                            // Increment state
+                            if((curand_uniform(&rnd_state) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
+                                model[automata_model_index] = automata_temp + 1;
+                            }
+                        }
+                        // Assumes that the automata is a for automata (since it is not an against automata)
+                        else {
+
+                            // Decrement state
+                            if((curand_uniform(&rnd_state) <= (1.0 / s)) && automata_temp > 1) {
+                                model[automata_model_index] = automata_temp - 1;
+                            }
+                        }
+
+                    }
+                    // Assumes that the sample is 1 (since it was not 0)
+                    else {
+                    
+                        // Check if the automata is a for automata
+                        if(automata_polarity == 1) {
+                    
+                            // Decrement the state 
+                            if((curand_uniform(&rnd_state) <= ((s - 1.0) / s)) && (automata_temp < max_state)) {
+                                model[automata_model_index] = automata_temp + 1;
+                            }
+                        }
+                        // Assumes that the automata is an against automata (since it is not an for automata)
+                        else {
+                        
+                            // Decrement state
+                            if((curand_uniform(&rnd_state) <= (1.0 / s)) && automata_temp > 1) {
+                                model[automata_model_index] = automata_temp - 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Some cleanup and persistence before exiting
+    // Copy back the random state
+    random_states[global_thread_id] = rnd_state;
+}
+
+__global__ 
+void type_2_feedback(unsigned int* model, unsigned int* clauses_feedback, unsigned int* x_data, bool* clauses_output, unsigned int class_id, unsigned int sample_id, const bool correct_class, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int max_state, unsigned int threshold, float s, curandState* random_states) {
+    
+    // Calculate and declare some "private variables"
+    // Get the clause id, based on the block id in the grid
+    unsigned int global_thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
+   
+    // Used to calculate the absolute index of an automata
+    unsigned int automata_model_index;
+    unsigned int automata_temp;
+
+    // Used to tempromary store whether an automata is in include or exclude state 
+    bool action;
+
+    // Used to tempromary store the polarity of an automata
+    int automata_polarity;
+
+    // Used to tempromary store the feature id of which feature an automata is associated with
+    unsigned int sample_value;
+
+    // Get the random state from the random values matrix (used to generate "random" numbers)
+    curandState rnd_state = random_states[global_thread_id];
+
+    // In case there are more clauses than blocks, we need to loop them 
+    for(unsigned int clause_id = blockIdx.x; clause_id < clauses_amount; clause_id += gridDim.x) {
+        
+        // Check if we are going to give type 2 feedback
+        if(clauses_feedback[clause_id] == 2) {
+        
+            // Check if the clause was evaluated to true in the evaluation phase. 
+            if(clauses_output[clause_id] == 1) {
+            
+                // Loop over all the automatas
+                for(unsigned int automata_id = threadIdx.x; automata_id < automatas_amount; automata_id += blockDim.x) {
+            
+                    // Calculate the automata model index
+                    automata_model_index = (class_id * clauses_amount * automatas_amount) + (clause_id * automatas_amount) + automata_id;
+
+                    // Get the automata value
+                    automata_temp = model[automata_model_index];
+
+                    // Get the sample's value
+                    sample_value = x_data[(sample_id * features_amount) + (automata_id / 2)];
+
+                    // Calculate the polarity of the automata
+                    automata_polarity = get_polarity(automata_id);
+
+                    // Get the include/exclude action for the automata
+                    action = automata_action(automata_temp, max_state);
+
+                    // Check if the automata is an for automata and that the feature is 0
+                    if((automata_polarity == 1) && (sample_value == 0)){
+
+                        // Check that the automata is in an exclude state and that we are not at max state
+                        if((action == false) && (automata_temp < max_state)){
+                        
+                            model[automata_model_index] = automata_temp + 1;
+                        }
+                    }
+                    else if((automata_polarity == -1) && (sample_value == 1)){
+
+                        // Check that the automata is in an exclude state and that we are not at max state
+                        if((action == false) && (automata_temp < max_state)){
+                        
+                            model[automata_model_index] = automata_temp + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Some cleanup and persistence before exiting
+    // Copy back the random state
     random_states[global_thread_id] = rnd_state;
 }
 
@@ -341,13 +544,21 @@ void give_feedback_to_clauses(unsigned int* model, unsigned int* clauses_feedbac
                     action = automata_action(automata_temp, max_state);
 
                     // Check if the automata is an for automata and that the feature is 0
-                    if((automata_polarity == 1) && (sample_value == 0) && (action == false) && (automata_temp < max_state)){
+                    if((automata_polarity == 1) && (sample_value == 0)){
+
+                        // Check that the automata is in an exclude state and that we are not at max state
+                        if((action == false) && (automata_temp < max_state)){
                         
-                        model[automata_model_index] = automata_temp + 1;
+                            model[automata_model_index] = automata_temp + 1;
+                        }
                     }
-                    else if((automata_polarity == -1) && (sample_value == 1) && (action == false) && (automata_temp < max_state)){
+                    else if((automata_polarity == -1) && (sample_value == 1)){
 
-                        model[automata_model_index] = automata_temp + 1;
+                        // Check that the automata is in an exclude state and that we are not at max state
+                        if((action == false) && (automata_temp < max_state)){
+                        
+                            model[automata_model_index] = automata_temp + 1;
+                        }
                     }
                 }
             }
@@ -359,110 +570,6 @@ void give_feedback_to_clauses(unsigned int* model, unsigned int* clauses_feedbac
     random_states[global_thread_id] = rnd_state;
 }
 
-
-__global__ 
-void improved_feedback(unsigned int* model, unsigned int* clauses_feedback, unsigned int* x_data, bool* clauses_output, unsigned int class_id, unsigned int sample_id, const bool correct_class, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int max_state, unsigned int threshold, float s, curandState* random_states) {
-    
-    // Data indexing
-    unsigned int global_thread_id = (blockIdx.x * blockDim.x) + threadIdx.x;
-    unsigned int clause_id;
-    unsigned int automata_id;
-    unsigned int feature_id;
-   
-    // Model indexing
-    unsigned int model_index;
-
-    // Used to tempromary store the polarity of an automata
-    int automata_polarity;
-    unsigned int clause_feedback_type;
-    bool clause_output;
-    unsigned int automata_value;
-    unsigned int sample_value;
-
-    // Get the random state from the random values matrix (used to generate "random" numbers)
-    curandState rnd_state = random_states[global_thread_id];
-
-    // In case there are more clauses than blocks, we need to loop them 
-    for(unsigned int model_relative_index = global_thread_id; model_relative_index < (clauses_amount * automatas_amount); model_relative_index += gridDim.x) {
-
-        // Calculate the position in the model
-        model_index = (class_id * clauses_amount * automatas_amount) + model_relative_index;
-        clause_id = model_relative_index / automatas_amount;
-        automata_id = model_relative_index % automatas_amount;
-        feature_id = automata_id / 2;
-
-        // Get the feedback type
-        clause_feedback_type = clauses_feedback[clause_id];
-        clause_output = clauses_output[clause_id];
-
-        // Get the clause value and sample value
-        automata_polarity = get_polarity(automata_id);
-        automata_value = model[model_index];
-        sample_value = x_data[(sample_id * features_amount) + feature_id];
-
-        // Check if we are to do type 1 feedback
-        if(clause_feedback_type == 1){
-        
-            // If the clause output was evaluated to false
-            if(clause_output == false) {
-
-                // Punish the automata if the following conditions are met
-                model[model_index] = automata_value - static_cast<int>((curand_uniform(&rnd_state) <= (1.0f / s)) && (automata_value > 1));
-            }
-            else {                
-
-                // Check if the sample was False
-                if(sample_value == 0) {
-            
-                    // Check if the automata is an against automata
-                    if(automata_polarity == -1){
-                    
-                        // Increment state if the conditions are met
-                        model[model_index] = automata_value + static_cast<int>((curand_uniform(&rnd_state) <= ((s - 1.0f) / s)) && (automata_value < max_state));
-                    }
-                    // Assumes that the automata is a for automata (since it is not an against automata)
-                    else {
-
-                        // Decrement the state if the conditions are met
-                        model[model_index] = automata_value - static_cast<int>((curand_uniform(&rnd_state) <= (1.0f / s)) && automata_value > 1);
-                    }
-
-                }
-                // Assumes that the sample is 1 (since it was not 0)
-                else {
-                
-                    // Check if the automata is a for automata
-                    if(automata_polarity == 1) {
-                
-                        // Decrement the state if the conditions are met
-                        model[model_index] = automata_value + static_cast<int>((curand_uniform(&rnd_state) <= ((s - 1.0f) / s)) && (automata_value < max_state));
-                    }
-                    // Assumes that the automata is an against automata (since it is not an for automata)
-                    else {
-                    
-                        // Increment state if the conditions are met
-                        model[model_index] = automata_value - static_cast<int>((curand_uniform(&rnd_state) <= (1.0f / s)) && automata_value > 1);
-                    }
-                }
-            }
-            
-        }
-        // Check if we are to do type 2 feedback
-        else if(clause_feedback_type == 2) {
-        
-            // Check if the clause was evaluated to true in the evaluation phase. 
-            if(clause_output == true) {
-
-                // Increment the state if the conditions are met
-                model[model_index] = automata_value + static_cast<int>(((automata_polarity == 1) && (sample_value == 0)) || ((automata_polarity == -1) && (sample_value == 1)) && (automata_action(automata_value, max_state) == false) && (automata_value < max_state));
-            }
-        }
-    }
-
-    // Some cleanup and persistence before exiting
-    // Copy back the random state
-    random_states[global_thread_id] = rnd_state;
-}
 
 __global__ 
 void initialize_random_states(curandState* states, int seed, unsigned int amount_of_states) {
