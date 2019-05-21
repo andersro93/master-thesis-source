@@ -117,6 +117,13 @@ int main(int argc, const char* argv[])
             kernel.enable_gpu(gpu_id);
         }
 
+        // Check if we are using experimental S
+        if(std::stoi(argv[3]) == 2) {
+            
+            printf("Experimental S enabled with an delta of %f \n", DELTA_S);
+            kernel.enable_ssl_s(DELTA_S);
+        }
+
         // Load the created model
         kernel.load_model(model.data, model.classes, model.clauses, model.automatas, model.max_states);
 

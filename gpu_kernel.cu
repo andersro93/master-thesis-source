@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <iostream>
 #include <cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -24,6 +25,15 @@ GPUKernel::GPUKernel(){
     }
 
 };
+
+void GPUKernel::enable_ssl_s(double delta_s) {
+
+    // Store the delta for s
+    this->delta_s = delta_s;
+
+    // Enable the SSL for s flag
+    this->ssl_s_enabled = true;
+}
 
 void GPUKernel::enable_gpu(unsigned int gpu_id) {
 
@@ -151,7 +161,25 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
     // Create a new random generator
     TsetlinRandomWheel* random_generator = new TsetlinRandomWheel(rand(), this->classes_amount, 65565);
 
+    // Create time objects
     float* training_times = new float[this->classes_amount];
+
+    // Create an array that will hold the accuracy for each epochs
+    double* accuracy_epochs = (double*) malloc(sizeof(double) * epochs);
+    float s_tempromary = s;
+
+    // Declare filestream for writing the results
+    std::ofstream result_stream;
+
+    // If feedback, open a result file 
+    if(feedback == true) {
+
+        // Open the filestream
+        result_stream.open("training_result.csv");
+
+        // Write the header of the file
+        result_stream << "epoch;accuracy;s;s_temp;time\n";
+    }
 
     // Start looping the epochs
     for(int epoch = 1; epoch <= epochs; epoch++)
@@ -160,6 +188,54 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
         if(feedback == true){
             printf("Epoch %d \n", epoch);
         }
+
+        // Check if we are using ssl on the S value
+        if(validation == true && this->ssl_s_enabled == true) {
+            
+            // Check if we are on a epoch that is divisble by 3 (then we are to perform a calculation for the new S value)
+            if((epoch % 3) == 0 && epoch != 0) {
+                
+                // Check if one of the variants on the S value is better than the current one
+                if(std::max(accuracy_epochs[epoch-2], accuracy_epochs[epoch-1]) > accuracy_epochs[epoch-3]){
+
+                    // The accuracy has been better when adjusting down or up
+                    // Lets figure out which way to adjust, lets check if the optimal was to adjust up
+                    if(accuracy_epochs[epoch-2] > accuracy_epochs[epoch-1]) {
+                        s -= this->delta_s;
+                        printf("Adjusting the S value to %f \n", s);
+                    }
+                    // Assuming that moving the S in positive direction is better. Or that they are equal, in that case, increase.
+                    else{
+                        s += this->delta_s;
+                        printf("Adjusting the S value to %f \n", s);
+                    }
+
+                    // Set the tempromary s value to the new s value
+                    s_tempromary = s;
+                }
+            }
+            // Check if we are on the epoch to decrement the S value
+            else if((epoch % 3) == 1) {
+                s_tempromary = s - this->delta_s;
+
+                if(feedback == true) {
+                    printf("Current S value %f \n", s);
+                    printf("Attempting S value %f \n", s_tempromary);
+                }
+            }
+            // Check if we are on the epoch to increment the S value
+            else if((epoch % 3) == 2){
+                s_tempromary = s + this->delta_s;
+
+                if(feedback == true) {
+                    printf("Current S value %f \n", s);
+                    printf("Attempting S value %f \n", s_tempromary);
+                }
+            }
+        }
+
+        // Start the epoch timer
+        auto start = chrono::high_resolution_clock::now(); 
 
         // Start all the worker threads
         for(unsigned int class_id = 0; class_id < this->classes_amount; class_id++) {
@@ -171,7 +247,7 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
                     this->enabled_gpus[class_id % this->enabled_gpus.size()],
                     batches,
                     threshold,
-                    s,
+                    s_tempromary,
                     this->model,
                     this->x_train,
                     this->y_train,
@@ -193,6 +269,12 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
             worker_threads[class_id].join();
         }
 
+        // Stop the timer
+        auto stop = chrono::high_resolution_clock::now(); 
+
+        // Calculate the time used in seconds
+        double time_used = chrono::duration_cast<chrono::nanoseconds>(stop - start).count() / 1000000000.0;
+
         // Check if we are to print the time for each class
         if(feedback) {
 
@@ -209,6 +291,9 @@ void GPUKernel::fit(int epochs, int batches, bool validation, int threshold, flo
         {
             // If validation is turned on
             validate(feedback);
+
+            // Print to file
+            result_stream << epoch << ";" << accuracy_epochs[epoch] << ";" << s << ";" <<s_tempromary << ";" << time_used << "\n";
         }
 
         if(print_model_after_epoch == true) {
@@ -373,7 +458,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
 
     // Create a stream for the class
     cudaStream_t class_stream;
-    switch(cudaStreamCreateWithFlags(&class_stream, cudaStreamNonBlocking)) {
+    switch(cudaStreamCreateWithFlags(&class_stream, cudaStreamDefault)) {
         case cudaSuccess:
             break;
         case cudaErrorInvalidValue:
@@ -391,7 +476,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
     cudaMalloc(&score, sizeof(int));
 
     unsigned int* clauses_feedback;
-    cudaMallocManaged(&clauses_feedback, sizeof(unsigned int) * classes_amount);
+    cudaMallocManaged(&clauses_feedback, sizeof(unsigned int) * clauses_amount);
 
     curandState* random_states;
     cudaMalloc(&random_states, sizeof(curandState) * clauses_amount * automatas_amount);
@@ -403,16 +488,18 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
     dim3 blocks = GPUKernel::calculate_blocks_per_kernel(clauses_amount);
     dim3 threads = GPUKernel::calculate_threads_per_block(automatas_amount);
 
+    unsigned int automatas_total = clauses_amount * automatas_amount;
+
     unsigned int reduce_votes_blocks = 1; // Due to the nature of the kernel, anyway its not like there are millions of clauses
-    unsigned int reduce_votes_threads = (static_cast<unsigned int>(clauses_amount / 32) + 1) * 32;
+    unsigned int reduce_votes_threads = ((clauses_amount / 32) + 1) * 32;
 
     unsigned int calculate_feedback_blocks = 1; // This value will stay at one, unless we need more blocks
-    unsigned int calculate_feedback_threads = (static_cast<unsigned int>(clauses_amount / 32) + 1) * 32;
+    unsigned int calculate_feedback_threads = ((clauses_amount / 32) + 1) * 32;
 
     if(calculate_feedback_threads > 1024) {
         
         // Update the amount of blocks that are required
-        calculate_feedback_blocks = (static_cast<unsigned int>(clauses_amount / calculate_feedback_threads)) + 1;
+        calculate_feedback_blocks = ((clauses_amount / calculate_feedback_threads)) + 1;
 
         // Set the amount of threads to be maximum
         calculate_feedback_threads = 1024;
@@ -449,7 +536,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
             if(correct_class || (random_generator->get_random_float(class_id)) < (1.0f / (1.0f * classes_amount))) {
                        
                 // Evaluate the clause output
-                validate_clauses<<<blocks, threads, 0, class_stream>>>(
+                validate_clauses<<<(automatas_total / 32) + 1, 32, 0, class_stream>>>(
                         model, 
                         clauses_output, 
                         x_data, 
@@ -484,7 +571,7 @@ void GPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int gpu_id
                 );
 
                 // Perform feedback on the model
-                give_feedback_to_clauses<<<blocks, threads, 0, class_stream>>>(
+                give_feedback_to_clauses<<<(automatas_total / 32) + 1, 32, 0, class_stream>>>(
                         model, 
                         clauses_feedback, 
                         x_data, 
@@ -547,7 +634,7 @@ void GPUKernel::validate_class(unsigned int class_id, unsigned int gpu_id, unsig
 
     // Create a stream for the thread
     cudaStream_t class_stream;
-    switch(cudaStreamCreateWithFlags(&class_stream, cudaStreamNonBlocking)) {
+    switch(cudaStreamCreateWithFlags(&class_stream, cudaStreamDefault)) {
         case cudaSuccess:
             break;
         case cudaErrorInvalidValue:

@@ -2,6 +2,9 @@
 #include <curand.h>
 #include <curand_kernel.h>
 #include <vector>
+#include <iostream>
+#include <stdio.h>
+#include <fstream>
 #include "kernels.cuh"
 #include "tsetlin_random_wheel.cuh"
 
@@ -26,6 +29,7 @@ public:
 
   // Training methods
   void fit(int epochs, int batches, bool validation, int threshold, float s, bool feedback = false, bool print_model_after_epoch = false);
+  void enable_ssl_s(double delta_s);
   double validate(bool feedback = false);
 
   private:
@@ -54,6 +58,10 @@ public:
   unsigned int features_amount {0};
   unsigned int automatas_amount {0};
   unsigned int states_amount {0};
+
+  // Training related values
+  bool ssl_s_enabled {false};
+  double delta_s {0.0};
 
   // Private training methods
   static void train_class_one_epoch(unsigned int class_id, unsigned int gpu_id, unsigned int batches, unsigned int threshold, float s, unsigned int* model, unsigned int* x_data, unsigned int* y_data, unsigned int samples, unsigned int classes_amount, unsigned int clauses_amount, unsigned int features_amount, unsigned int automatas_amount, unsigned int states_amount, float* training_times, TsetlinRandomWheel* random_generator);

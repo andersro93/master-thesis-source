@@ -419,7 +419,7 @@ void CPUKernel::train_class_one_epoch(unsigned int class_id, unsigned int batche
             correct_class = (class_id == y_data[sample_id]);
 
             // Check if we are to train the sample on the current class or not
-            if(correct_class || random_generator->get_random_float(class_id) < (1.0f / (1.0f * classes_amount))) {
+            if(correct_class || (random_generator->get_random_float(class_id) < (1.0f / (1.0f * classes_amount)))) {
                        
                 // Evaluate the clause output
                 validate_clauses(
